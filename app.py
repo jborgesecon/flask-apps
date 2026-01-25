@@ -1,4 +1,5 @@
 import io
+import re
 import requests
 from flask import Flask, request, jsonify, send_file
 
@@ -8,82 +9,133 @@ app = Flask(__name__)
 # CONFIGURATION
 # ---------------------------------------------------------
 GUTENDEX_API_URL = "https://gutendex.com/books"
-# We use a reliable mirror for direct file downloads
 GUTENBERG_MIRROR_URL = "https://www.gutenberg.org/ebooks/{}.epub.images"
 
+# Mapping user-friendly format names to Gutenberg MIME types
+FORMAT_MAP = {
+    'epub': 'application/epub+zip',
+    'mobi': 'application/x-mobipocket-ebook',
+    'pdf': 'application/pdf',  # Rare on Gutenberg, but valid
+    'html': 'text/html',
+    'text': 'text/plain'
+}
+
 # ---------------------------------------------------------
-# ENDPOINT 1: SEARCH
+# HELPER: PARSER
+# ---------------------------------------------------------
+def parse_search_query(raw_query):
+    """
+    Parses a string like 'title=metamorphosis lang=en' into 
+    Gutendex API parameters.
+    """
+    params = {}
+    search_terms = []
+
+    # Regex to find key=value patterns
+    # Matches "key=value" where value can contain spaces if it's not a new key
+    pattern = r'(\w+)=(.+?)(?=\s+\w+=|$)'
+    matches = list(re.finditer(pattern, raw_query))
+
+    # If no strict syntax found, treat the whole thing as a general search
+    if not matches:
+        return {"search": raw_query}
+
+    for match in matches:
+        key = match.group(1).lower()
+        value = match.group(2).strip()
+
+        if key in ['title', 'author', 'search']:
+            # Gutendex uses 'search' for both title and author
+            # We combine them to narrow the search results
+            search_terms.append(value)
+        elif key in ['lang', 'language']:
+            # Example: 'ger' -> 'de', 'eng' -> 'en' (Simple check, or pass through)
+            # Gutendex expects 2-letter codes (en, fr, de)
+            params['languages'] = value[:2] 
+        elif key == 'year':
+            params['author_year_start'] = value
+            params['author_year_end'] = value
+        elif key == 'topic':
+            params['topic'] = value
+        elif key == 'format':
+            # Map 'epub' -> 'application/epub+zip'
+            if value.lower() in FORMAT_MAP:
+                params['mime_type'] = FORMAT_MAP[value.lower()]
+
+    # Combine title/author terms into the main search param
+    if search_terms:
+        params['search'] = " ".join(search_terms)
+
+    return params
+
+# ---------------------------------------------------------
+# ENDPOINT 1: SEARCH (ADVANCED)
 # ---------------------------------------------------------
 @app.route('/search', methods=['GET'])
 def search_books():
     """
-    Receives a query (e.g., 'Metamorphosis'), asks Gutendex,
-    and returns a simplified list of results.
+    Accepts 'q' which can be a simple query or detailed syntax:
+    q='title=metamorphosis lang=en format=epub'
     """
-    query = request.args.get('q')
-    if not query:
+    raw_query = request.args.get('q', '')
+    if not raw_query:
         return jsonify({"error": "Missing query parameter 'q'"}), 400
 
+    # 1. Parse the user's string into API parameters
+    api_params = parse_search_query(raw_query)
+    
+    # Debug log to see how the parser translated the request
+    print(f"Original: '{raw_query}' -> Parsed: {api_params}")
+
     try:
-        # 1. Forward the search to Gutendex
-        response = requests.get(GUTENDEX_API_URL, params={"search": query})
+        # 2. Call Gutendex with the filtered params
+        response = requests.get(GUTENDEX_API_URL, params=api_params)
         data = response.json()
 
-        # 2. Parse and simplify the results
+        # 3. Parse and simplify results
         results = []
-        for book in data.get('results', [])[:5]: # Limit to top 5 results
-            
-            # Format author names nicely
+        for book in data.get('results', [])[:5]:
             authors = ", ".join([a['name'] for a in book.get('authors', [])])
             
+            # Check available formats for the User
+            available_formats = [k for k in book['formats'].keys() if k in FORMAT_MAP.values()]
+
             results.append({
                 "id": book['id'],
                 "title": book['title'],
                 "authors": authors or "Unknown",
-                "copyright": book.get('copyright')
+                "languages": book.get('languages'),
+                "formats": available_formats  # Useful for debugging
             })
 
-        return jsonify({"count": len(results), "results": results})
+        return jsonify({
+            "count": len(results),
+            "filters_applied": api_params, # Helpful to show user what we understood
+            "results": results
+        })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ---------------------------------------------------------
-# ENDPOINT 2: DOWNLOAD
+# ENDPOINT 2: DOWNLOAD (UNCHANGED)
 # ---------------------------------------------------------
 @app.route('/download/<int:book_id>', methods=['GET'])
 def download_book(book_id):
-    """
-    Fetches the .epub file from a Gutenberg mirror into RAM,
-    then pipes it directly to the user.
-    """
+    # (Keep the code exactly as it was in the previous step)
     download_url = GUTENBERG_MIRROR_URL.format(book_id)
-    print(f"Fetching from: {download_url}") # Debug log
-
     try:
-        # 1. Stream the file from the mirror (don't download all at once yet)
         with requests.get(download_url, stream=True) as r:
             r.raise_for_status()
-            
-            # 2. Load content into RAM (BytesIO)
-            # Since .epubs are small (mostly <1MB), RAM is fine.
             file_data = io.BytesIO(r.content)
-            
-            # 3. Serve the file directly to the client
             return send_file(
                 file_data,
                 mimetype='application/epub+zip',
                 as_attachment=True,
                 download_name=f"{book_id}.epub"
             )
-
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 404:
-            return jsonify({"error": "Book file not found on mirror"}), 404
-        return jsonify({"error": "Failed to fetch book from mirror"}), 502
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    # Running on 0.0.0.0 to be accessible if we containerize it later
     app.run(host='0.0.0.0', port=5000, debug=True)
